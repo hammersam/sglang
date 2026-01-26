@@ -1,12 +1,176 @@
 from typing import Any, Optional
+import os
+import pathlib
+import tempfile
 
 import pytest
 import torch
-from sgl_kernel import (
-    fast_topk_transform_fused,
-    fast_topk_transform_ragged_fused,
-    fast_topk_v2,
-)
+
+# JIT compile topk.cu instead of importing from sgl_kernel
+# This allows running tests without compiling the entire sgl_kernel package
+
+_TOPK_MODULE = None
+
+# Binding source code for JIT compilation
+_BINDING_CODE = '''
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <optional>
+
+void fast_topk_interface(
+    const at::Tensor& score,
+    at::Tensor& indices,
+    const at::Tensor& lengths,
+    std::optional<at::Tensor> row_starts_opt);
+
+void fast_topk_transform_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q,
+    std::optional<at::Tensor> row_starts_opt);
+
+void fast_topk_transform_ragged_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& topk_indices_ragged,
+    const at::Tensor& topk_indices_offset,
+    std::optional<at::Tensor> row_starts_opt);
+
+// Python binding wrappers - convert c10::optional to std::optional
+void py_fast_topk(
+    const at::Tensor& score,
+    at::Tensor& indices,
+    const at::Tensor& lengths,
+    const c10::optional<at::Tensor>& row_starts_opt) {
+    fast_topk_interface(score, indices, lengths,
+        row_starts_opt.has_value() ? std::optional<at::Tensor>(row_starts_opt.value()) : std::nullopt);
+}
+
+void py_fast_topk_transform(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q,
+    const c10::optional<at::Tensor>& row_starts_opt) {
+    fast_topk_transform_interface(score, lengths, dst_page_table, src_page_table, cu_seqlens_q,
+        row_starts_opt.has_value() ? std::optional<at::Tensor>(row_starts_opt.value()) : std::nullopt);
+}
+
+void py_fast_topk_transform_ragged(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& topk_indices_ragged,
+    const at::Tensor& topk_indices_offset,
+    const c10::optional<at::Tensor>& row_starts_opt) {
+    fast_topk_transform_ragged_interface(score, lengths, topk_indices_ragged, topk_indices_offset,
+        row_starts_opt.has_value() ? std::optional<at::Tensor>(row_starts_opt.value()) : std::nullopt);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fast_topk", &py_fast_topk, "Fast TopK CUDA kernel");
+    m.def("fast_topk_transform_fused", &py_fast_topk_transform, "Fast TopK Transform CUDA kernel");
+    m.def("fast_topk_transform_ragged_fused", &py_fast_topk_transform_ragged, "Fast TopK Transform Ragged CUDA kernel");
+}
+'''
+
+
+def _get_topk_module():
+    """JIT compile the topk CUDA kernel."""
+    global _TOPK_MODULE
+    if _TOPK_MODULE is not None:
+        return _TOPK_MODULE
+
+    from torch.utils.cpp_extension import load
+
+    # Get the path to the source files
+    current_dir = pathlib.Path(__file__).parent.absolute()
+    sgl_kernel_root = current_dir.parent
+    csrc_dir = sgl_kernel_root / "csrc"
+    include_dir = sgl_kernel_root / "include"
+
+    topk_cu = csrc_dir / "elementwise" / "topk.cu"
+
+    if not topk_cu.exists():
+        raise FileNotFoundError(f"topk.cu not found at {topk_cu}")
+
+    # Use a temp directory for the binding file
+    with tempfile.TemporaryDirectory() as tmpdir:
+        binding_file = pathlib.Path(tmpdir) / "topk_binding.cpp"
+        binding_file.write_text(_BINDING_CODE)
+
+        _TOPK_MODULE = load(
+            name="topk_kernel_test",
+            sources=[str(binding_file), str(topk_cu)],
+            extra_include_paths=[str(include_dir)],
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            verbose=True,
+        )
+
+    return _TOPK_MODULE
+
+
+# Python wrapper functions that match the sgl_kernel interface
+def fast_topk_v2(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Get the topk indices of the score tensor.
+    """
+    assert topk == 2048, "fast_topk_v2 is only optimized for deepseek v3.2 model, where topk=2048"
+    assert score.dim() == 2
+    topk_indices = score.new_empty((score.size(0), topk), dtype=torch.int32)
+    module = _get_topk_module()
+    module.fast_topk(score, topk_indices, lengths, row_starts)
+    return topk_indices
+
+
+def fast_topk_transform_fused(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    page_table_size_1: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Get the topk indices and transform to page table indices.
+    """
+    assert topk == 2048, "fast_topk_transform_fused is only optimized for deepseek v3.2 model, where topk=2048"
+    assert score.dim() == 2
+    src_page_table = page_table_size_1
+    dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
+    module = _get_topk_module()
+    module.fast_topk_transform_fused(
+        score, lengths, dst_page_table, src_page_table, cu_seqlens_q, row_starts
+    )
+    return dst_page_table
+
+
+def fast_topk_transform_ragged_fused(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    topk_indices_offset: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Get the topk indices and transform to ragged kv indices.
+    """
+    assert topk == 2048, "fast_topk_transform_ragged_fused is only optimized for deepseek v3.2 model, where topk=2048"
+    assert score.dim() == 2
+    topk_indices_ragged = score.new_empty((score.shape[0], topk), dtype=torch.int32)
+    module = _get_topk_module()
+    module.fast_topk_transform_ragged_fused(
+        score, lengths, topk_indices_ragged, topk_indices_offset, row_starts
+    )
+    return topk_indices_ragged
 
 
 def _ref_torch_impl(
