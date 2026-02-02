@@ -63,6 +63,8 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.kvcacheio import (
+    mla_kv_fp4_dequant,
+    mla_kv_fp4_quant,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,

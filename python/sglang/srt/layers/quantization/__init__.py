@@ -40,6 +40,13 @@ from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
+
+# Import NVFP4 MLA scheme
+from sglang.srt.layers.quantization.fp4_mla_scheme import (
+    NVFP4MLAQuantizationConfig,
+    NVFP4MLAMemoryPoolHelper,
+    NVFP4MLAQuantizeMethod,
+)
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.utils import is_cuda, is_hip, is_npu, mxfp_supported
@@ -75,6 +82,9 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "auto-round": AutoRoundConfig,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
+    "nvfp4_mla": NVFP4MLAQuantizationConfig,
+    "fp4_mla": NVFP4MLAQuantizationConfig,  # Legacy alias
+    "fp4_kv": NVFP4MLAQuantizationConfig,   # Legacy alias
 }
 
 

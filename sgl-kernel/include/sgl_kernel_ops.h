@@ -590,6 +590,23 @@ void transfer_kv_direct(
     const at::Tensor dst_indices,
     int64_t page_size);
 
+/*
+ * MLA KV Cache FP4 Quantization
+ */
+void mla_kv_fp4_quant(
+    const torch::Tensor& k_nope,
+    const torch::Tensor& k_rope,
+    torch::Tensor& kv_buffer,
+    torch::Tensor& kv_scale_buffer,
+    const torch::Tensor& loc);
+
+void mla_kv_fp4_dequant(
+    torch::Tensor& k_nope,
+    torch::Tensor& k_rope,
+    const torch::Tensor& kv_buffer,
+    const torch::Tensor& kv_scale_buffer,
+    const torch::Tensor& loc);
+
 void transfer_kv_per_layer_direct_pf_lf(
     const std::vector<at::Tensor>& src_ptrs,
     std::vector<at::Tensor> dst_ptrs,

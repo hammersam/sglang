@@ -353,6 +353,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
 
   /*
+   * MLA KV Cache FP4 Quantization
+   */
+  m.def(
+      "mla_kv_fp4_quant(Tensor k_nope, Tensor k_rope, Tensor! kv_buffer, Tensor! kv_scale_buffer, "
+      "Tensor loc) -> ()");
+  m.impl("mla_kv_fp4_quant", torch::kCUDA, &mla_kv_fp4_quant);
+
+  m.def(
+      "mla_kv_fp4_dequant(Tensor! k_nope, Tensor! k_rope, Tensor kv_buffer, Tensor kv_scale_buffer, "
+      "Tensor loc) -> ()");
+  m.impl("mla_kv_fp4_dequant", torch::kCUDA, &mla_kv_fp4_dequant);
+
+  /*
    * From csrc/memory
    */
   m.def("store_kv_cache(Tensor k_cache, Tensor v_cache, Tensor out_loc, Tensor k, Tensor v) -> ()");

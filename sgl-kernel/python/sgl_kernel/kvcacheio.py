@@ -305,3 +305,47 @@ def transfer_kv_all_layer_mla_lf_pf(
         block_quota,
         num_warps_per_block,
     )
+
+
+def mla_kv_fp4_quant(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    kv_scale_buffer: torch.Tensor,
+    loc: torch.Tensor,
+):
+    """
+    Quantize MLA KV cache (k_nope and k_rope) to FP4 format.
+    
+    Args:
+        k_nope: [num_tokens, 1, kv_lora_rank] BF16/FP16 tensor
+        k_rope: [num_tokens, 1, qk_rope_head_dim] BF16/FP16 tensor
+        kv_buffer: Output buffer for packed FP4 data [num_pages, 1, (kv_lora_rank + qk_rope_head_dim) / 2]
+        kv_scale_buffer: Output buffer for UE8M0 scale factors [num_pages, (kv_lora_rank + qk_rope_head_dim) / 16]
+        loc: Token locations in the cache [num_tokens]
+    """
+    torch.ops.sgl_kernel.mla_kv_fp4_quant.default(
+        k_nope, k_rope, kv_buffer, kv_scale_buffer, loc
+    )
+
+
+def mla_kv_fp4_dequant(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    kv_scale_buffer: torch.Tensor,
+    loc: torch.Tensor,
+):
+    """
+    Dequantize MLA KV cache from FP4 format.
+    
+    Args:
+        k_nope: Output [num_tokens, 1, kv_lora_rank] BF16/FP16 tensor
+        k_rope: Output [num_tokens, 1, qk_rope_head_dim] BF16/FP16 tensor
+        kv_buffer: Input packed FP4 data [num_pages, 1, (kv_lora_rank + qk_rope_head_dim) / 2]
+        kv_scale_buffer: Input UE8M0 scale factors [num_pages, (kv_lora_rank + qk_rope_head_dim) / 16]
+        loc: Token locations in the cache [num_tokens]
+    """
+    torch.ops.sgl_kernel.mla_kv_fp4_dequant.default(
+        k_nope, k_rope, kv_buffer, kv_scale_buffer, loc
+    )

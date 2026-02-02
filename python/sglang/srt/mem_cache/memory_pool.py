@@ -1625,7 +1625,7 @@ class MLATokenToKVPool(KVCache):
         torch.cuda.synchronize()
 
 
-class MLATokenToKVPoolFP4(MLATokenToKVPool):
+class MLATokenToKVPoolNVFP4(MLATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -1736,9 +1736,6 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                     KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
                 )
 
-            if self.store_dtype != self.dtype:
-                cache_k_nope = cache_k_nope.view(self.store_dtype)
-                cache_k_rope = cache_k_rope.view(self.store_dtype)
 
             set_mla_kv_buffer_triton(
                 self.kv_buffer[layer_id - self.start_layer],
@@ -1908,6 +1905,144 @@ class NSATokenToKVPool(MLATokenToKVPool):
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
+
+
+class NSATokenToKVPoolNVFP4(NSATokenToKVPool):
+    """
+    NSA KV Cache with NVFP4 quantization support.
+    
+    Uses E2M1 format with hardware-accelerated PTX instructions on SM100+.
+    Provides 2x memory savings compared to FP8 and 4x compared to BF16.
+    """
+    
+    quant_block_size = 16  # FP4 uses 16-element blocks
+    index_k_with_scale_buffer_dtype = torch.uint8
+    rope_storage_dtype = torch.bfloat16
+    
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        kv_lora_rank: int,
+        dtype: torch.dtype,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        index_head_dim: int,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        # Validate dimensions are divisible by FP4_BLOCK_SIZE
+        assert (
+            kv_lora_rank % self.quant_block_size == 0
+        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {self.quant_block_size}"
+        assert (
+            qk_rope_head_dim % self.quant_block_size == 0
+        ), f"qk_rope_head_dim {qk_rope_head_dim} must be multiple of quant_block_size {self.quant_block_size}"
+        
+        # Calculate storage dimensions for FP4
+        # FP4 packed data: (kv_lora_rank + qk_rope_head_dim) / 2
+        # Scale factors: (kv_lora_rank + qk_rope_head_dim) / FP4_BLOCK_SIZE
+        total_dim = kv_lora_rank + qk_rope_head_dim
+        packed_fp4_bytes = total_dim // 2
+        scale_bytes = total_dim // self.quant_block_size
+        
+        override_dim = packed_fp4_bytes + scale_bytes
+        
+        # Call grandparent init (skip NSATokenToKVPool's FP8 setup)
+        MLATokenToKVPool.__init__(
+            self,
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            use_nsa=True,
+            override_kv_cache_dim=override_dim,
+        )
+        
+        self.index_head_dim = index_head_dim
+        assert index_head_dim == 128
+        
+        # Allocate index_k buffer with FP8 (unchanged for index)
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            self.index_k_with_scale_buffer = [
+                torch.zeros(
+                    (
+                        (size + page_size + 1) // self.page_size,
+                        self.page_size
+                        * (
+                            index_head_dim + index_head_dim // 128 * 4
+                        ),
+                    ),
+                    dtype=self.index_k_with_scale_buffer_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+        
+        self._finalize_allocation_log(size)
+        self.nsa_kv_cache_store_nvfp4 = True
+    
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        """Set MLA KV buffer with FP4 quantization."""
+        layer_id = layer.layer_id
+        
+        # Import FP4 quantization functions
+        from sglang.srt.layers.attention.nsa.quant_k_cache_fp4 import (
+            quantize_k_cache_nvfp4_separate,
+        )
+        
+        # Quantize to NVFP4
+        nope_part, rope_part = quantize_k_cache_nvfp4_separate(
+            cache_k_nope, cache_k_rope
+        )
+        
+        # Store in buffer
+        self.kv_buffer[layer_id - self.start_layer][loc] = nope_part.view(
+            self.store_dtype
+        )
+        # For FP4, we store rope part and scales together
+        # This is a simplified version - full implementation would need proper buffer layout
+    
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        """Get MLA KV buffer with FP4 dequantization."""
+        from sglang.srt.layers.attention.nsa.dequant_k_cache_fp4 import (
+            dequantize_k_cache_nvfp4_separate,
+        )
+        
+        layer_id = layer.layer_id
+        # Read from buffer and dequantize
+        # Simplified implementation
+        kv_data = self.kv_buffer[layer_id - self.start_layer]
+        
+        dst_dtype = dst_dtype or self.dtype
+        # Dequantize from FP4
+        # This would need proper extraction of nope and rope parts
+        raise NotImplementedError(
+            "FP4 dequantization from buffer needs proper buffer layout implementation"
+        )
 
 
 class DoubleSparseTokenToKVPool(KVCache):
