@@ -1,6 +1,26 @@
+import os
 from typing import Optional
 
 import torch
+
+_USE_JIT_TOPK = os.environ.get("SGLANG_USE_JIT_TOPK", "1") == "1"
+_jit_topk_checked = False
+_jit_topk_available = False
+
+
+def _check_jit_topk() -> bool:
+    """Lazily check if JIT topk is available (only once)."""
+    global _jit_topk_checked, _jit_topk_available
+    if _jit_topk_checked:
+        return _jit_topk_available
+    _jit_topk_checked = True
+    try:
+        from sglang.jit_kernel.topk import can_use_jit_topk
+
+        _jit_topk_available = can_use_jit_topk()
+    except ImportError:
+        _jit_topk_available = False
+    return _jit_topk_available
 
 
 def fast_topk(values, topk, dim):
@@ -33,6 +53,11 @@ def fast_topk_v2(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
+    if _USE_JIT_TOPK and _check_jit_topk():
+        from sglang.jit_kernel.topk import fast_topk_v2_jit
+
+        return fast_topk_v2_jit(score, lengths, topk, row_starts)
+
     assert (
         topk == 2048
     ), "fast_topk_v2 is only optimized for deepseek v3.2 model, where topk=2048"
@@ -68,6 +93,13 @@ def fast_topk_transform_fused(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
+    if _USE_JIT_TOPK and _check_jit_topk():
+        from sglang.jit_kernel.topk import fast_topk_transform_fused_jit
+
+        return fast_topk_transform_fused_jit(
+            score, lengths, page_table_size_1, cu_seqlens_q, topk, row_starts
+        )
+
     assert (
         topk == 2048
     ), "fast_topk_transform_fused is only optimized for deepseek v3.2 model, where topk=2048"
@@ -106,6 +138,13 @@ def fast_topk_transform_ragged_fused(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
+    if _USE_JIT_TOPK and _check_jit_topk():
+        from sglang.jit_kernel.topk import fast_topk_transform_ragged_fused_jit
+
+        return fast_topk_transform_ragged_fused_jit(
+            score, lengths, topk_indices_offset, topk, row_starts
+        )
+
     assert (
         topk == 2048
     ), "fast_topk_transform_ragged_fused is only optimized for deepseek v3.2 model, where topk=2048"
